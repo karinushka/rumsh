@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub async fn run_client(server_addr: SocketAddr, key_bytes: [u8; 32], overlay: bool) -> Result<()> {
-    let std_socket = StdUdpSocket::bind("0.0.0.0:0")?;
+    let local_bind = match server_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let std_socket = StdUdpSocket::bind(local_bind)?;
     std_socket.set_nonblocking(true)?;
     let socket = Arc::new(Async::new(std_socket)?);
     log::info!("Connecting to server at {}...", server_addr);
