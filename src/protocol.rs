@@ -43,6 +43,9 @@ pub struct ServerPacket {
     pub payload: ServerPayload,
 }
 
+pub const TARGET_MTU: usize = 1200;
+pub const FRAGMENT_PAYLOAD_SIZE: usize = 1024;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedClientPacket {
     pub session_id: u64,
@@ -55,6 +58,8 @@ pub struct EncryptedClientPacket {
 pub struct EncryptedServerPacket {
     pub seq_num: u64,
     pub ack_seq_num: u64,
+    pub frag_idx: u16,
+    pub total_frags: u16,
     pub ciphertext: Vec<u8>,
 }
 

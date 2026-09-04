@@ -49,7 +49,6 @@ impl PtyBridge {
         })?;
 
         let parts: Vec<&str> = shell_cmd.split_whitespace().collect();
-        eprintln!("DEBUG PTY PARTS: {:?}", parts);
         if parts.is_empty() {
             return Err(anyhow::anyhow!("Empty shell command"));
         }
@@ -214,6 +213,13 @@ pub struct FakePty {
 }
 
 #[cfg(test)]
+impl Default for FakePty {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl FakePty {
     pub fn new() -> Self {
         Self {
@@ -235,6 +241,7 @@ impl PtyBackend for FakePty {
         Ok(())
     }
     fn is_echo_recommended(&self) -> bool {
-        self.echo_recommended.load(std::sync::atomic::Ordering::Relaxed)
+        self.echo_recommended
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }

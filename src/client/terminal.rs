@@ -243,9 +243,7 @@ impl ClientTerminal {
         if frame.dirty || frame.clear_requested {
             frame.copy_to(dest);
             frame.dirty = false;
-            for d in &mut frame.row_dirty {
-                *d = false;
-            }
+            let _ = &mut frame.row_dirty.fill(false);
             frame.clear_requested = false;
             true
         } else {

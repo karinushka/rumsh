@@ -15,7 +15,10 @@ pub enum SessionAction<C: PacketCodec> {
     SendPacket { bytes: Vec<u8>, target: SocketAddr },
     /// Offload compiling/compressing/encrypting a diff job to a blocking thread pool.
     /// When the job returns `Ok(bytes)`, send those bytes to `target`.
-    OffloadDiffJob { job: UpdateJob<C>, target: SocketAddr },
+    OffloadDiffJob {
+        job: UpdateJob<C>,
+        target: SocketAddr,
+    },
     /// Triggered when the remote shell has exited. Tear down the UDP socket and exit.
     Shutdown,
 }
@@ -58,8 +61,8 @@ impl<C: PacketCodec> Eq for UpdateJob<C> {}
 
 impl<C: PacketCodec> UpdateJob<C> {
     /// Runs the heavy CPU work: diffing, LZ4 compression, encryption, and serialization via codec.
-    /// Returns the final serialized UDP packet bytes.
-    pub fn run(self) -> Result<Vec<u8>> {
+    /// Returns the final serialized UDP packet bytes (may be multiple fragments).
+    pub fn run(self) -> Result<Vec<Vec<u8>>> {
         let start = Instant::now();
         let update = self.current_state.diff_from(
             self.ref_state.as_ref(),
@@ -70,7 +73,7 @@ impl<C: PacketCodec> UpdateJob<C> {
 
         let seal_start = Instant::now();
         let frame_payload = ServerPayload::Frame(update);
-        let packet_bytes = self
+        let packets = self
             .codec
             .seal_server(self.seq, self.ack_seq, &frame_payload)?;
         let seal_time = seal_start.elapsed();
@@ -84,7 +87,7 @@ impl<C: PacketCodec> UpdateJob<C> {
             total_time
         );
 
-        Ok(packet_bytes)
+        Ok(packets)
     }
 }
 
@@ -122,9 +125,10 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         let pty_clone = pty.clone();
         term_state.setup_pty_callback(move |data| {
             if let Ok(p) = pty_clone.lock()
-                && let Err(e) = p.write(data) {
-                    log::error!("Error writing terminal back to PTY: {:?}", e);
-                }
+                && let Err(e) = p.write(data)
+            {
+                log::error!("Error writing terminal back to PTY: {:?}", e);
+            }
         })?;
 
         let now = Instant::now();
@@ -184,13 +188,16 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                 session_id: self.session_id,
             };
             self.seq_num += 1;
-            let serialized =
+            let packets =
                 self.codec
                     .seal_server(self.seq_num, wire_packet.seq_num, &ack_payload)?;
-            let mut actions = vec![SessionAction::SendPacket {
-                bytes: serialized,
-                target: self.current_client_addr,
-            }];
+            let mut actions = Vec::new();
+            for bytes in packets {
+                actions.push(SessionAction::SendPacket {
+                    bytes,
+                    target: self.current_client_addr,
+                });
+            }
             actions.extend(self.check_sync(now));
             return Ok(actions);
         }
@@ -254,9 +261,10 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                 ClientPayload::Keystrokes(keys) => {
                     log::trace!("Received keystrokes seq={}, size={}", seq, keys.len());
                     if let Ok(p) = self.pty.lock()
-                        && let Err(e) = p.write(&keys) {
-                            log::error!("Error writing to PTY: {:?}", e);
-                        }
+                        && let Err(e) = p.write(&keys)
+                    {
+                        log::error!("Error writing to PTY: {:?}", e);
+                    }
                 }
                 ClientPayload::Resize { cols, rows } => {
                     log::info!("Received resize request: {}x{} (seq={})", cols, rows, seq);
@@ -270,13 +278,15 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                     log::trace!("Received KeepAlive, queueing reply...");
                     let reply_payload = ServerPayload::KeepAlive;
                     self.seq_num += 1;
-                    let serialized =
+                    let packets =
                         self.codec
                             .seal_server(self.seq_num, self.ack_seq_num, &reply_payload)?;
-                    actions.push(SessionAction::SendPacket {
-                        bytes: serialized,
-                        target: self.current_client_addr,
-                    });
+                    for bytes in packets {
+                        actions.push(SessionAction::SendPacket {
+                            bytes,
+                            target: self.current_client_addr,
+                        });
+                    }
                 }
                 ClientPayload::Handshake { .. } => unreachable!(),
             }
@@ -299,9 +309,10 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
     pub fn prepare_shutdown(&mut self) -> Result<SessionAction<C>> {
         let shutdown_payload = ServerPayload::Shutdown;
         self.seq_num += 1;
-        let serialized = self.codec.seal_server(self.seq_num, 0, &shutdown_payload)?;
+        let mut packets = self.codec.seal_server(self.seq_num, 0, &shutdown_payload)?;
+        let bytes = packets.pop().unwrap_or_default();
         Ok(SessionAction::SendPacket {
-            bytes: serialized,
+            bytes,
             target: self.current_client_addr,
         })
     }
@@ -432,7 +443,14 @@ mod tests {
         let _ = session.feed_packet(&pkt1, addr, Instant::now()).unwrap();
         assert_eq!(session.ack_seq_num, 1);
         assert_eq!(
-            session.pty.lock().unwrap().written.lock().unwrap().as_slice(),
+            session
+                .pty
+                .lock()
+                .unwrap()
+                .written
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[b"a".to_vec()]
         );
 
@@ -448,7 +466,14 @@ mod tests {
         assert_eq!(session.ack_seq_num, 3);
         assert!(session.out_of_order_packets.is_empty());
         assert_eq!(
-            session.pty.lock().unwrap().written.lock().unwrap().as_slice(),
+            session
+                .pty
+                .lock()
+                .unwrap()
+                .written
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
         );
     }
@@ -491,7 +516,14 @@ mod tests {
         assert_eq!(session.ack_seq_num, 5);
         assert!(session.out_of_order_packets.is_empty());
         assert_eq!(
-            session.pty.lock().unwrap().written.lock().unwrap().as_slice(),
+            session
+                .pty
+                .lock()
+                .unwrap()
+                .written
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[
                 b"1".to_vec(),
                 b"2".to_vec(),
@@ -511,9 +543,7 @@ mod tests {
             AuthoritativeSession::new(12345, codec, 0, addr, 80, 24, fake_pty).unwrap();
 
         let pkt1 = make_client_packet(&session, 1, &ClientPayload::Keystrokes(b"a".to_vec()));
-        let _ = session
-            .feed_packet(&pkt1, addr, Instant::now())
-            .unwrap();
+        let _ = session.feed_packet(&pkt1, addr, Instant::now()).unwrap();
 
         // Feed duplicate packet 1 -> expect check_sync called after cooldown
         session.term_state.write(b"x");
@@ -543,7 +573,14 @@ mod tests {
         );
         let actions = session.feed_packet(&pkt, addr, Instant::now()).unwrap();
         assert_eq!(
-            session.pty.lock().unwrap().resized.lock().unwrap().as_slice(),
+            session
+                .pty
+                .lock()
+                .unwrap()
+                .resized
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[(100, 40)]
         );
         assert_eq!(actions.len(), 1);
@@ -564,7 +601,8 @@ mod tests {
         match &actions[0] {
             SessionAction::SendPacket { bytes, target } => {
                 assert_eq!(*target, addr);
-                let (server_packet, payload, _stats) = session.codec.open_server(bytes).unwrap();
+                let (server_packet, payload, _stats) =
+                    session.codec.open_server(bytes).unwrap().unwrap();
                 assert_eq!(server_packet.seq_num, 1);
                 assert_eq!(server_packet.ack_seq_num, 1);
                 assert!(matches!(payload, ServerPayload::KeepAlive));

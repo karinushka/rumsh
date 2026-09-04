@@ -1,9 +1,7 @@
 use crate::client::escape::{EscapeCommand, EscapeInterpreter, InterpreterResult};
 use crate::client::terminal::{ClientTerminal, TerminalFrame};
 use crate::protocol::codec::PacketCodec;
-use crate::protocol::{
-    ClientPayload, CompactGrapheme, GridState, LocalCellData, ServerPayload,
-};
+use crate::protocol::{ClientPayload, CompactGrapheme, GridState, LocalCellData, ServerPayload};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -98,7 +96,11 @@ impl<C: PacketCodec> MirrorSession<C> {
 
     pub fn feed_packet(&mut self, packet_bytes: &[u8], now: Instant) -> Result<Vec<ClientAction>> {
         let (wire_packet, payload, stats) = match self.codec.open_server(packet_bytes) {
-            Ok(res) => res,
+            Ok(Some(res)) => res,
+            Ok(None) => {
+                // Fragment received and buffered, waiting for remaining fragments
+                return Ok(Vec::new());
+            }
             Err(e) => {
                 log::debug!("Failed to open server packet: {:?}", e);
                 return Ok(Vec::new());
@@ -328,7 +330,10 @@ impl<C: PacketCodec> MirrorSession<C> {
         let packet_bytes = self.prepare_resize(cols, rows, now)?;
         self.mirror.abort_prediction();
         self.mirror.mark_dirty();
-        Ok(vec![ClientAction::SendPacket(packet_bytes), ClientAction::Paint])
+        Ok(vec![
+            ClientAction::SendPacket(packet_bytes),
+            ClientAction::Paint,
+        ])
     }
 
     pub fn on_tick(&mut self, now: Instant) -> Result<Vec<ClientAction>> {
@@ -429,7 +434,8 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
 
-        self.unacked_packets.insert(seq, (packet_bytes.clone(), now));
+        self.unacked_packets
+            .insert(seq, (packet_bytes.clone(), now));
         Ok((packet_bytes, seq))
     }
 
@@ -444,7 +450,8 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
 
-        self.unacked_packets.insert(seq, (packet_bytes.clone(), now));
+        self.unacked_packets
+            .insert(seq, (packet_bytes.clone(), now));
         Ok(packet_bytes)
     }
 
@@ -458,7 +465,8 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
 
-        self.unacked_packets.insert(seq, (packet_bytes.clone(), now));
+        self.unacked_packets
+            .insert(seq, (packet_bytes.clone(), now));
         Ok(packet_bytes)
     }
 }
@@ -476,7 +484,11 @@ mod tests {
 
         // 1. Feed keystrokes (seq = 1)
         let actions = session.feed_stdin(b"a", now).unwrap();
-        assert!(actions.iter().any(|a| matches!(a, ClientAction::SendPacket(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ClientAction::SendPacket(_)))
+        );
         assert_eq!(session.sent_packets.len(), 1);
 
         // Simulate 50ms passage of time
@@ -486,11 +498,15 @@ mod tests {
         let server_payload = ServerPayload::KeepAlive;
         let ack_bytes = session.codec.seal_server(1, 1, &server_payload).unwrap();
 
-        let _ = session.feed_packet(&ack_bytes, later).unwrap();
+        let _ = session.feed_packet(&ack_bytes[0], later).unwrap();
 
         let rtt = session.mirror.rtt_ms();
         assert!(rtt >= 45, "RTT should be at least 45ms, got {}", rtt);
-        assert!(rtt < 150, "RTT should be within reasonable bound, got {}", rtt);
+        assert!(
+            rtt < 150,
+            "RTT should be within reasonable bound, got {}",
+            rtt
+        );
         assert!(session.sent_packets.is_empty());
         assert!(session.unacked_packets.is_empty());
     }
@@ -502,23 +518,27 @@ mod tests {
         let mut session = MirrorSession::new(12345, codec, 1, 80, 24, false, now);
 
         let make_packet = |session: &MirrorSession<NullCodec>, seq: u64| -> Vec<u8> {
-            session.codec.seal_server(seq, 0, &ServerPayload::KeepAlive).unwrap()
+            let mut pkts = session
+                .codec
+                .seal_server(seq, 0, &ServerPayload::KeepAlive)
+                .unwrap();
+            pkts.pop().unwrap()
         };
 
         let _ = session.feed_packet(&make_packet(&session, 1), now).unwrap();
         assert_eq!(session.expected_server_seq, 2);
         assert_eq!(session.loss_window.len(), 1);
-        assert_eq!(session.loss_window[0], true);
+        assert!(session.loss_window[0]);
 
         let _ = session.feed_packet(&make_packet(&session, 3), now).unwrap();
         assert_eq!(session.expected_server_seq, 4);
         assert_eq!(session.loss_window.len(), 3);
-        assert_eq!(session.loss_window[1], false);
-        assert_eq!(session.loss_window[2], true);
+        assert!(!session.loss_window[1]);
+        assert!(session.loss_window[2]);
 
         let _ = session.feed_packet(&make_packet(&session, 2), now).unwrap();
         assert_eq!(session.loss_window.len(), 3);
-        assert_eq!(session.loss_window[1], true);
+        assert!(session.loss_window[1]);
     }
 
     #[test]
@@ -531,13 +551,28 @@ mod tests {
         assert_eq!(session.unacked_packets.len(), 1);
 
         let actions = session.on_tick(now + Duration::from_millis(50)).unwrap();
-        assert!(!actions.iter().any(|a| matches!(a, ClientAction::SendPacket(_))));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ClientAction::SendPacket(_)))
+        );
 
         let actions = session.on_tick(now + Duration::from_millis(300)).unwrap();
-        assert_eq!(actions.iter().filter(|a| matches!(a, ClientAction::SendPacket(_))).count(), 1);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, ClientAction::SendPacket(_)))
+                .count(),
+            1
+        );
 
-        let ack_bytes = session.codec.seal_server(1, 1, &ServerPayload::KeepAlive).unwrap();
-        let _ = session.feed_packet(&ack_bytes, now + Duration::from_millis(350)).unwrap();
+        let ack_bytes = session
+            .codec
+            .seal_server(1, 1, &ServerPayload::KeepAlive)
+            .unwrap();
+        let _ = session
+            .feed_packet(&ack_bytes[0], now + Duration::from_millis(350))
+            .unwrap();
 
         assert!(session.unacked_packets.is_empty());
     }

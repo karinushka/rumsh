@@ -1,6 +1,9 @@
 use crate::crypto::CryptoManager;
 use crate::protocol::codec::ChaChaCodec;
-use crate::protocol::{ClientPayload, EncryptedClientPacket, EncryptedServerPacket, ServerPayload, deserialize, serialize};
+use crate::protocol::{
+    ClientPayload, EncryptedClientPacket, EncryptedServerPacket, ServerPayload, deserialize,
+    serialize,
+};
 use crate::server::pty::PtyBridge;
 use crate::server::session::{AuthoritativeSession, SessionAction};
 use anyhow::Result;
@@ -137,6 +140,8 @@ async fn wait_for_client_handshake(
                 let ack_packet = EncryptedServerPacket {
                     seq_num: reply_seq,
                     ack_seq_num: wire_packet.seq_num,
+                    frag_idx: 0,
+                    total_frags: 1,
                     ciphertext,
                 };
                 if let Ok(serialized) = serialize(&ack_packet) {
@@ -245,8 +250,10 @@ pub async fn run_server(
                 SessionAction::OffloadDiffJob { job, target } => {
                     let socket = socket.clone();
                     smol::spawn(async move {
-                        if let Ok(serialized) = blocking::unblock(move || job.run()).await {
-                            let _ = socket.send_to(&serialized, target).await;
+                        if let Ok(packets) = blocking::unblock(move || job.run()).await {
+                            for serialized in packets {
+                                let _ = socket.send_to(&serialized, target).await;
+                            }
                         }
                     })
                     .detach();
@@ -269,8 +276,7 @@ pub async fn run_server(
                 loop {
                     match pty_rx.recv().await {
                         Ok(data) => {
-                            let actions =
-                                session.borrow_mut().on_pty_bytes(&data, Instant::now());
+                            let actions = session.borrow_mut().on_pty_bytes(&data, Instant::now());
                             execute_actions(actions, &socket, &shutdown_tx);
                             smol::future::yield_now().await;
                         }
@@ -297,8 +303,10 @@ pub async fn run_server(
                     if shutdown_tx.is_closed() {
                         break;
                     }
-                    let actions = session.borrow_mut().on_tick(Instant::now());
-                    execute_actions(actions, &socket, &shutdown_tx);
+                    if let Ok(mut session_ref) = session.try_borrow_mut() {
+                        let actions = session_ref.on_tick(Instant::now());
+                        execute_actions(actions, &socket, &shutdown_tx);
+                    }
                 }
             })
             .detach();
@@ -335,13 +343,13 @@ pub async fn run_server(
             let _ = shutdown_rx.recv().await;
             log::info!("PTY exited. Sending shutdown packet to client and shutting down server.");
 
-            if let Ok(action) = session.borrow_mut().prepare_shutdown()
-                && let SessionAction::SendPacket { bytes, target } = action {
-                    for _ in 0..3 {
-                        let _ = socket.send_to(&bytes, target).await;
-                        Timer::after(Duration::from_millis(50)).await;
-                    }
+            let action = session.borrow_mut().prepare_shutdown();
+            if let Ok(SessionAction::SendPacket { bytes, target }) = action {
+                for _ in 0..3 {
+                    let _ = socket.send_to(&bytes, target).await;
+                    Timer::after(Duration::from_millis(50)).await;
                 }
+            }
         }
     };
 

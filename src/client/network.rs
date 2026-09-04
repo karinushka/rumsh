@@ -139,7 +139,11 @@ pub async fn run_client(server_addr: SocketAddr, key_bytes: [u8; 32], overlay: b
                 match read_res {
                     Ok((0, _)) => break,
                     Ok((n, buf)) => {
-                        if tx.send(ClientEvent::Stdin(buf[..n].to_vec())).await.is_err() {
+                        if tx
+                            .send(ClientEvent::Stdin(buf[..n].to_vec()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }

@@ -130,8 +130,8 @@ impl<B: LifecycleBackend> Drop for TerminalLifecycle<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct FakeLifecycleBackend {
