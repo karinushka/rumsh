@@ -104,6 +104,8 @@ pub struct AuthoritativeSession<P: PtyBackend, C: PacketCodec> {
     pub current_client_addr: SocketAddr,
     pub last_recv_time: Instant,
     pub last_sync_time: Instant,
+    pub last_pty_bytes_time: Instant,
+    pub pty_bytes_acc: usize,
     pub dirty: bool,
     pub term_state: ServerTerminalState<'static>,
     pub pty: Arc<Mutex<P>>,
@@ -145,6 +147,8 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
             current_client_addr: initial_client_addr,
             last_recv_time: now,
             last_sync_time: now,
+            last_pty_bytes_time: now,
+            pty_bytes_acc: 0,
             dirty: false,
             term_state,
             pty,
@@ -296,10 +300,11 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         Ok(actions)
     }
 
-    pub fn on_pty_bytes(&mut self, data: &[u8], now: Instant) -> Vec<SessionAction<C>> {
+    pub fn on_pty_bytes(&mut self, data: &[u8], now: Instant) {
         self.term_state.write(data);
         self.dirty = true;
-        self.check_sync(now)
+        self.last_pty_bytes_time = now;
+        self.pty_bytes_acc = self.pty_bytes_acc.saturating_add(data.len());
     }
 
     pub fn on_tick(&mut self, now: Instant) -> Vec<SessionAction<C>> {
@@ -319,8 +324,22 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
 
     fn check_sync(&mut self, now: Instant) -> Vec<SessionAction<C>> {
         let mut actions = Vec::new();
-        if self.seq_num > 0 && now.duration_since(self.last_sync_time) < Duration::from_millis(16) {
+
+        // 1. Calculate dynamic sync interval based on flood state
+        let time_since_pty = now.duration_since(self.last_pty_bytes_time);
+        let is_flooding = self.pty_bytes_acc > 2048 && time_since_pty < Duration::from_millis(50);
+        let min_interval = if is_flooding {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_millis(16)
+        };
+
+        if self.seq_num > 0 && now.duration_since(self.last_sync_time) < min_interval {
             return actions;
+        }
+
+        if time_since_pty >= Duration::from_millis(50) {
+            self.pty_bytes_acc = 0;
         }
 
         if !self.dirty && self.ack_seq_num <= self.last_sent_ack_seq {
@@ -359,17 +378,29 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         self.dirty = false;
         self.last_sync_time = now;
 
+        // Retain up to 200 states so rapid bursts don't evict client's reference state
         while !self.state_history.is_empty()
             && self.state_history.front().unwrap().0 < self.client_ack_seq
+            && self.state_history.len() > 100
         {
             self.state_history.pop_front();
         }
 
-        let ref_state_opt = self
-            .state_history
-            .iter()
-            .find(|(seq, _)| *seq == self.client_ack_seq)
-            .map(|(_, s)| s.clone());
+        // If client ACK is lagging by more than 5 frames or reference state is missing,
+        // force a full frame from scratch (ref_seq = 0) to instantly heal the connection.
+        let lag = self.seq_num.saturating_sub(self.client_ack_seq);
+        let force_full_sync = lag > 5;
+
+        let ref_state_opt = if force_full_sync {
+            log::info!("[HEAL] Client ACK lag={} > 5, forcing full-sync baseline (ref_seq=0)", lag);
+            None
+        } else {
+            self.state_history
+                .iter()
+                .find(|(seq, _)| *seq == self.client_ack_seq)
+                .map(|(_, s)| s.clone())
+        };
+
         let ref_seq = if ref_state_opt.is_some() {
             self.client_ack_seq
         } else {
@@ -384,7 +415,7 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         self.state_history
             .push_back((seq, latest_state_cloned.clone()));
 
-        if self.state_history.len() > 50 {
+        if self.state_history.len() > 200 {
             self.state_history.pop_front();
         }
 
@@ -628,8 +659,35 @@ mod tests {
         let actions2 = session.on_tick(Instant::now());
         assert!(actions2.is_empty());
 
-        let actions3 = session.on_pty_bytes(b"x", Instant::now() + Duration::from_millis(20));
+        session.on_pty_bytes(b"x", Instant::now() + Duration::from_millis(20));
+        let actions3 = session.on_tick(Instant::now() + Duration::from_millis(20));
         assert_eq!(actions3.len(), 1);
         assert_eq!(session.state_history.len(), 2);
+    }
+
+    #[test]
+    fn test_flood_mode_throttling() {
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let fake_pty = FakePty::new();
+        let codec = NullCodec::new(12345);
+        let mut session =
+            AuthoritativeSession::new(12345, codec, 0, addr, 80, 24, fake_pty).unwrap();
+
+        let start = Instant::now();
+        // Initial tick
+        session.dirty = true;
+        let actions = session.on_tick(start);
+        assert_eq!(actions.len(), 1);
+
+        // Simulate flood of 4KB PTY bytes
+        session.on_pty_bytes(&[b'a'; 4096], start + Duration::from_millis(10));
+
+        // Normal 16ms tick (elapsed 25ms since last sync) -> should be THROTTLED because flood interval is 150ms
+        let actions_throttled = session.on_tick(start + Duration::from_millis(25));
+        assert!(actions_throttled.is_empty(), "Expected flood mode to throttle intermediate tick");
+
+        // Tick after 160ms (exceeding 150ms) -> should emit consolidated frame
+        let actions_flooded = session.on_tick(start + Duration::from_millis(165));
+        assert_eq!(actions_flooded.len(), 1, "Expected tick to fire after flood interval");
     }
 }

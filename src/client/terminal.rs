@@ -254,17 +254,25 @@ impl ClientTerminal {
     pub fn record_rtt_loss(&self, rtt_ms: Option<u32>, loss_pct: Option<f32>) {
         let mut inner = self.inner.write().unwrap();
         let frame = &mut inner.frame;
+        let mut changed = false;
         if let Some(rtt) = rtt_ms {
-            if frame.rtt_ms == 0 {
-                frame.rtt_ms = rtt;
+            let new_rtt = if frame.rtt_ms == 0 {
+                rtt
             } else {
-                frame.rtt_ms = (frame.rtt_ms as f32 * 0.8 + rtt as f32 * 0.2) as u32;
+                (frame.rtt_ms as f32 * 0.8 + rtt as f32 * 0.2) as u32
+            };
+            if frame.rtt_ms != new_rtt {
+                frame.rtt_ms = new_rtt;
+                changed = true;
             }
         }
-        if let Some(loss) = loss_pct {
+        if let Some(loss) = loss_pct
+            && (frame.packet_loss_pct - loss).abs() > 0.1
+        {
             frame.packet_loss_pct = loss;
+            changed = true;
         }
-        if frame.overlay_enabled {
+        if changed && frame.overlay_enabled {
             frame.dirty = true;
         }
     }
@@ -272,19 +280,25 @@ impl ClientTerminal {
     pub fn record_bandwidth_compression(&self, kb_s: f32, ratio: f32) {
         let mut inner = self.inner.write().unwrap();
         let frame = &mut inner.frame;
-        frame.bandwidth_kb_s = kb_s;
-        frame.compression_ratio = ratio;
-        if frame.overlay_enabled {
-            frame.dirty = true;
+        let bw_diff = (frame.bandwidth_kb_s - kb_s).abs();
+        let cr_diff = (frame.compression_ratio - ratio).abs();
+        if bw_diff > 0.1 || cr_diff > 0.1 {
+            frame.bandwidth_kb_s = kb_s;
+            frame.compression_ratio = ratio;
+            if frame.overlay_enabled {
+                frame.dirty = true;
+            }
         }
     }
 
     pub fn record_fps(&self, fps: u32) {
         let mut inner = self.inner.write().unwrap();
         let frame = &mut inner.frame;
-        frame.fps = fps;
-        if frame.overlay_enabled {
-            frame.dirty = true;
+        if frame.fps != fps {
+            frame.fps = fps;
+            if frame.overlay_enabled {
+                frame.dirty = true;
+            }
         }
     }
 

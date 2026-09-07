@@ -37,6 +37,7 @@ pub struct MirrorSession<C: PacketCodec> {
     // KeepAlive & Reconnection Tracking
     pub last_keepalive_sent: Instant,
     pub keepalive_interval: Duration,
+    pub last_ack_sent: Instant,
     pub is_reconnecting: bool,
 
     // Telemetry & Loss Window
@@ -80,6 +81,7 @@ impl<C: PacketCodec> MirrorSession<C> {
             last_arq_check: now,
             last_keepalive_sent: now,
             keepalive_interval: Duration::from_secs(2),
+            last_ack_sent: now,
             is_reconnecting: false,
             expected_server_seq: start_server_seq,
             loss_window: VecDeque::new(),
@@ -225,6 +227,10 @@ impl<C: PacketCodec> MirrorSession<C> {
                             update.ref_seq,
                             seq
                         );
+                        // Promptly notify server with our latest acknowledged sequence so it can send a full frame
+                        if let Ok(ack_bytes) = self.prepare_ack(now) {
+                            actions.push(ClientAction::SendPacket(ack_bytes));
+                        }
                         return Ok(actions);
                     }
                     GridState {
@@ -254,11 +260,18 @@ impl<C: PacketCodec> MirrorSession<C> {
                     self.mirror.abort_prediction();
                 }
                 self.state_history.push_back((seq, new_state));
-                if self.state_history.len() > 100 {
+                if self.state_history.len() > 200 {
                     self.state_history.pop_front();
                 }
 
                 actions.push(ClientAction::Paint);
+
+                // Send rate-limited ACK packet back to server
+                if now.duration_since(self.last_ack_sent) >= Duration::from_millis(30)
+                    && let Ok(ack_bytes) = self.prepare_ack(now)
+                {
+                    actions.push(ClientAction::SendPacket(ack_bytes));
+                }
             }
             ServerPayload::KeepAlive => {
                 log::debug!("Client received KeepAlive");
@@ -379,15 +392,19 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.mirror.set_reconnecting(needs_banner);
             actions.push(ClientAction::Paint);
 
-            // Adaptive heartbeat throttling during outages
+            // Adaptive heartbeat throttling during outages (slowly back off up to 3 minutes)
             self.keepalive_interval = if silence < Duration::from_secs(5) {
                 Duration::from_secs(2)
             } else if silence < Duration::from_secs(15) {
                 Duration::from_secs(5)
             } else if silence < Duration::from_secs(60) {
                 Duration::from_secs(15)
-            } else {
+            } else if silence < Duration::from_secs(180) {
                 Duration::from_secs(60)
+            } else if silence < Duration::from_secs(600) {
+                Duration::from_secs(120)
+            } else {
+                Duration::from_secs(180)
             };
         }
 
@@ -437,6 +454,20 @@ impl<C: PacketCodec> MirrorSession<C> {
         self.unacked_packets
             .insert(seq, (packet_bytes.clone(), now));
         Ok((packet_bytes, seq))
+    }
+
+    fn prepare_ack(&mut self, now: Instant) -> Result<Vec<u8>> {
+        self.seq_num += 1;
+        let seq = self.seq_num;
+        self.sent_packets.insert(seq, now);
+        self.last_ack_sent = now;
+
+        let payload = ClientPayload::Ack;
+        let packet_bytes =
+            self.codec
+                .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
+
+        Ok(packet_bytes)
     }
 
     fn prepare_keepalive(&mut self, now: Instant) -> Result<Vec<u8>> {

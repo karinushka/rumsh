@@ -235,34 +235,47 @@ pub async fn run_server(
 
     let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
 
-    let execute_actions = |actions: Vec<SessionAction<ChaChaCodec>>,
-                           socket: &Arc<UdpSocket>,
-                           shutdown_tx: &smol::channel::Sender<()>| {
-        for action in actions {
-            match action {
-                SessionAction::SendPacket { bytes, target } => {
-                    let socket = socket.clone();
-                    smol::spawn(async move {
-                        let _ = socket.send_to(&bytes, target).await;
-                    })
-                    .detach();
-                }
-                SessionAction::OffloadDiffJob { job, target } => {
-                    let socket = socket.clone();
-                    smol::spawn(async move {
-                        if let Ok(packets) = blocking::unblock(move || job.run()).await {
-                            for serialized in packets {
-                                let _ = socket.send_to(&serialized, target).await;
+    let diff_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let execute_actions = {
+        let diff_in_flight = diff_in_flight.clone();
+        Arc::new(
+            move |actions: Vec<SessionAction<ChaChaCodec>>,
+                  socket: &Arc<UdpSocket>,
+                  shutdown_tx: &smol::channel::Sender<()>| {
+            for action in actions {
+                match action {
+                    SessionAction::SendPacket { bytes, target } => {
+                        let socket = socket.clone();
+                        smol::spawn(async move {
+                            let _ = socket.send_to(&bytes, target).await;
+                        })
+                        .detach();
+                    }
+                    SessionAction::OffloadDiffJob { job, target } => {
+                        let socket = socket.clone();
+                        let in_flight = diff_in_flight.clone();
+                        in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+                        smol::spawn(async move {
+                            if let Ok(packets) = blocking::unblock(move || job.run()).await {
+                                let num_packets = packets.len();
+                                for (i, serialized) in packets.into_iter().enumerate() {
+                                    let _ = socket.send_to(&serialized, target).await;
+                                    if i + 1 < num_packets {
+                                        Timer::after(Duration::from_millis(1)).await;
+                                    }
+                                }
                             }
-                        }
-                    })
-                    .detach();
-                }
-                SessionAction::Shutdown => {
-                    let _ = shutdown_tx.try_send(());
+                            in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+                        })
+                        .detach();
+                    }
+                    SessionAction::Shutdown => {
+                        let _ = shutdown_tx.try_send(());
+                    }
                 }
             }
-        }
+        })
     };
 
     // Task 1: PTY Reader Task (converts PTY stream into terminal buffer inputs)
@@ -270,14 +283,14 @@ pub async fn run_server(
         let session = session.clone();
         let pty_rx = pty_rx.clone();
         let shutdown_tx = shutdown_tx.clone();
-        let socket = socket.clone();
         local_ex
             .spawn(async move {
                 loop {
                     match pty_rx.recv().await {
                         Ok(data) => {
-                            let actions = session.borrow_mut().on_pty_bytes(&data, Instant::now());
-                            execute_actions(actions, &socket, &shutdown_tx);
+                            if let Ok(mut session_ref) = session.try_borrow_mut() {
+                                session_ref.on_pty_bytes(&data, Instant::now());
+                            }
                             smol::future::yield_now().await;
                         }
                         Err(_) => {
@@ -296,12 +309,18 @@ pub async fn run_server(
         let session = session.clone();
         let socket = socket.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let diff_in_flight = diff_in_flight.clone();
+        let execute_actions = execute_actions.clone();
         local_ex
             .spawn(async move {
                 loop {
                     Timer::after(Duration::from_millis(16)).await;
                     if shutdown_tx.is_closed() {
                         break;
+                    }
+                    // Skip generating a new frame if a previous diff job is still in flight
+                    if diff_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
                     }
                     if let Ok(mut session_ref) = session.try_borrow_mut() {
                         let actions = session_ref.on_tick(Instant::now());
@@ -353,8 +372,20 @@ pub async fn run_server(
         }
     };
 
+    // Signal Handler for graceful termination on SIGINT/SIGTERM
+    let signal_handler = async {
+        if let Ok(mut signals) = Signals::new([Signal::Int, Signal::Term])
+            && let Some(sig) = signals.next().await
+        {
+            log::info!("Server received signal {:?}. Exiting run loop.", sig);
+        }
+    };
+
     local_ex
-        .run(smol::future::race(main_loop, shutdown_signal))
+        .run(smol::future::race(
+            main_loop,
+            smol::future::race(shutdown_signal, signal_handler),
+        ))
         .await;
     Ok(())
 }
