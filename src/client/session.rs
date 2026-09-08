@@ -40,6 +40,10 @@ pub struct MirrorSession<C: PacketCodec> {
     pub last_ack_sent: Instant,
     pub is_reconnecting: bool,
 
+    // Fragment NACK Tracking
+    pub last_nack_check: Instant,
+    pub nacked_frames: HashMap<u64, Instant>,
+
     // Telemetry & Loss Window
     pub expected_server_seq: u64,
     pub loss_window: VecDeque<bool>,
@@ -83,6 +87,8 @@ impl<C: PacketCodec> MirrorSession<C> {
             keepalive_interval: Duration::from_secs(2),
             last_ack_sent: now,
             is_reconnecting: false,
+            last_nack_check: now,
+            nacked_frames: HashMap::new(),
             expected_server_seq: start_server_seq,
             loss_window: VecDeque::new(),
             state_history: VecDeque::new(),
@@ -452,6 +458,27 @@ impl<C: PacketCodec> MirrorSession<C> {
             actions.push(ClientAction::Paint);
         }
 
+        // 5. Fragment NACK check (every 40ms)
+        if now.duration_since(self.last_nack_check) >= Duration::from_millis(40) {
+            self.last_nack_check = now;
+            let incomplete = self.codec.get_incomplete_frames();
+            for (frame_seq, received_mask) in incomplete {
+                let should_nack = match self.nacked_frames.get(&frame_seq) {
+                    Some(&last_sent) => now.duration_since(last_sent) >= Duration::from_millis(100),
+                    None => true,
+                };
+                if should_nack {
+                    self.nacked_frames.insert(frame_seq, now);
+                    let packet_bytes = self.prepare_fragment_nack(frame_seq, received_mask, now)?;
+                    actions.push(ClientAction::SendPacket(packet_bytes));
+                }
+            }
+            // Prune nacked_frames older than 2 seconds
+            self.nacked_frames.retain(|&seq, &mut time| {
+                seq > self.ack_seq_num && now.duration_since(time) < Duration::from_secs(2)
+            });
+        }
+
         Ok(actions)
     }
 
@@ -551,6 +578,36 @@ impl<C: PacketCodec> MirrorSession<C> {
 
         self.unacked_packets
             .insert(seq, (packet_bytes.clone(), now));
+        Ok(packet_bytes)
+    }
+
+    fn prepare_fragment_nack(
+        &mut self,
+        frame_seq: u64,
+        received_mask: Vec<u64>,
+        now: Instant,
+    ) -> Result<Vec<u8>> {
+        self.seq_num += 1;
+        let seq = self.seq_num;
+        self.sent_packets.insert(seq, now);
+
+        let payload = ClientPayload::FragmentNack {
+            frame_seq,
+            received_mask: received_mask.clone(),
+        };
+        let packet_bytes =
+            self.codec
+                .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
+
+        log::info!(
+            "[CLIENT] [TX_PACKET] seq={} ack={} type=FragmentNack frame_seq={} mask_len={} wire_bytes={} is_resent=false",
+            seq,
+            self.ack_seq_num,
+            frame_seq,
+            received_mask.len(),
+            packet_bytes.len()
+        );
+
         Ok(packet_bytes)
     }
 }

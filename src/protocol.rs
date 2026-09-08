@@ -18,6 +18,10 @@ pub enum ClientPayload {
     },
     KeepAlive,
     Ack,
+    FragmentNack {
+        frame_seq: u64,
+        received_mask: Vec<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

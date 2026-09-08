@@ -19,6 +19,12 @@ pub enum SessionAction<C: PacketCodec> {
         job: UpdateJob<C>,
         target: SocketAddr,
     },
+    /// Retransmit missing fragments for an earlier frame based on client's received_mask.
+    ResendFragments {
+        frame_seq: u64,
+        received_mask: Vec<u64>,
+        target: SocketAddr,
+    },
     /// Triggered when the remote shell has exited. Tear down the UDP socket and exit.
     Shutdown,
 }
@@ -227,6 +233,7 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
             ClientPayload::Keystrokes(_) => "Keystrokes",
             ClientPayload::Resize { .. } => "Resize",
             ClientPayload::KeepAlive => "KeepAlive",
+            ClientPayload::FragmentNack { .. } => "FragmentNack",
             ClientPayload::Handshake { .. } => "Handshake",
         };
         log::info!(
@@ -242,12 +249,10 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
 
         if seq_num < self.expected_client_seq {
             log::info!(
-                "[SERVER] [RX_DUPLICATE] seq={} < expected_seq={}. Triggering sync check.",
+                "[SERVER] [RX_DUPLICATE] seq={} < expected_seq={}. Dropping duplicate packet.",
                 seq_num,
                 self.expected_client_seq
             );
-            self.dirty = true;
-            actions.extend(self.check_sync(now));
             return Ok(actions);
         }
 
@@ -321,6 +326,22 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                             target: self.current_client_addr,
                         });
                     }
+                }
+                ClientPayload::FragmentNack {
+                    frame_seq,
+                    received_mask,
+                } => {
+                    log::info!(
+                        "[SERVER] [PROCESSED_FRAGMENT_NACK] seq={} frame_seq={} mask_len={}",
+                        seq,
+                        frame_seq,
+                        received_mask.len()
+                    );
+                    actions.push(SessionAction::ResendFragments {
+                        frame_seq,
+                        received_mask,
+                        target: self.current_client_addr,
+                    });
                 }
                 ClientPayload::Handshake { .. } => unreachable!(),
             }
@@ -621,14 +642,13 @@ mod tests {
         let pkt1 = make_client_packet(&session, 1, &ClientPayload::Keystrokes(b"a".to_vec()));
         let _ = session.feed_packet(&pkt1, addr, Instant::now()).unwrap();
 
-        // Feed duplicate packet 1 -> expect check_sync called after cooldown
+        // Feed duplicate packet 1 -> expect duplicate to be dropped without generating new actions
         session.term_state.write(b"x");
         session.dirty = true;
         let actions = session
             .feed_packet(&pkt1, addr, Instant::now() + Duration::from_millis(20))
             .unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], SessionAction::OffloadDiffJob { .. }));
+        assert!(actions.is_empty());
     }
 
     #[test]

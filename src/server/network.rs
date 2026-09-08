@@ -12,9 +12,10 @@ use async_signal::{Signal, Signals};
 use futures_lite::prelude::*;
 use smol::{LocalExecutor, Timer, channel};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct HandshakeResult {
@@ -24,6 +25,8 @@ pub struct HandshakeResult {
     pub cols: u16,
     pub rows: u16,
 }
+
+type FragmentCache = Arc<Mutex<VecDeque<(u64, Vec<Vec<u8>>)>>>;
 
 pub fn determine_bind_address(
     bind_ip_override: Option<std::net::IpAddr>,
@@ -236,9 +239,11 @@ pub async fn run_server(
     let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
 
     let diff_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fragment_cache: FragmentCache = Arc::new(Mutex::new(VecDeque::new()));
 
     let execute_actions = {
         let diff_in_flight = diff_in_flight.clone();
+        let fragment_cache = fragment_cache.clone();
         Arc::new(
             move |actions: Vec<SessionAction<ChaChaCodec>>,
                   socket: &Arc<UdpSocket>,
@@ -261,13 +266,33 @@ pub async fn run_server(
                     SessionAction::OffloadDiffJob { job, target } => {
                         let socket = socket.clone();
                         let in_flight = diff_in_flight.clone();
-                        in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let frag_cache = fragment_cache.clone();
+                        // If another diff job is already in flight, skip this one to prevent concurrent bursting
+                        if in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            log::info!(
+                                "[SERVER] [DIFF_SKIPPED_IN_FLIGHT] seq={} skipped because previous diff is still in flight",
+                                job.seq
+                            );
+                            continue;
+                        }
                         let job_seq = job.seq;
                         let job_ref = job.ref_seq;
                         let job_ack = job.ack_seq;
                         smol::spawn(async move {
                             if let Ok(packets) = blocking::unblock(move || job.run()).await {
                                 let num_packets = packets.len();
+                                if num_packets > 1 {
+                                    let mut cache = frag_cache.lock().unwrap();
+                                    if cache.len() >= 4 {
+                                        cache.pop_front();
+                                    }
+                                    cache.push_back((job_seq, packets.clone()));
+                                }
+                                let inter_frag_delay = if num_packets > 4 {
+                                    Duration::from_millis(3)
+                                } else {
+                                    Duration::from_millis(1)
+                                };
                                 for (i, serialized) in packets.into_iter().enumerate() {
                                     log::info!(
                                         "[SERVER] [TX_PACKET] seq={} ack={} ref_seq={} frag={}/{} wire_bytes={} target={}",
@@ -281,13 +306,67 @@ pub async fn run_server(
                                     );
                                     let _ = socket.send_to(&serialized, target).await;
                                     if i + 1 < num_packets {
-                                        Timer::after(Duration::from_millis(1)).await;
+                                        Timer::after(inter_frag_delay).await;
                                     }
                                 }
                             }
                             in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
                         })
                         .detach();
+                    }
+                    SessionAction::ResendFragments {
+                        frame_seq,
+                        received_mask,
+                        target,
+                    } => {
+                        let socket = socket.clone();
+                        let cached_packets = {
+                            let cache = fragment_cache.lock().unwrap();
+                            cache
+                                .iter()
+                                .find(|(seq, _)| *seq == frame_seq)
+                                .map(|(_, packets)| packets.clone())
+                        };
+
+                        if let Some(packets) = cached_packets {
+                            let total_frags = packets.len();
+                            log::info!(
+                                "[SERVER] [RETRANSMIT_FRAGS_START] frame_seq={} total_frags={} mask_len={}",
+                                frame_seq,
+                                total_frags,
+                                received_mask.len()
+                            );
+                            smol::spawn(async move {
+                                for (idx, packet_bytes) in packets.into_iter().enumerate() {
+                                    let word_idx = idx / 64;
+                                    let bit_idx = idx % 64;
+                                    let is_received = if word_idx < received_mask.len() {
+                                        (received_mask[word_idx] & (1u64 << bit_idx)) != 0
+                                    } else {
+                                        false
+                                    };
+
+                                    if !is_received {
+                                        log::info!(
+                                            "[SERVER] [TX_RETRANSMIT_FRAG] seq={} frag={}/{} wire_bytes={} target={}",
+                                            frame_seq,
+                                            idx,
+                                            total_frags,
+                                            packet_bytes.len(),
+                                            target
+                                        );
+                                        let _ = socket.send_to(&packet_bytes, target).await;
+                                        Timer::after(Duration::from_millis(1)).await;
+                                    }
+                                }
+                            })
+                            .detach();
+                        } else {
+                            log::warn!(
+                                "[SERVER] [RETRANSMIT_FRAGS_NOT_FOUND] frame_seq={} not in fragment cache",
+                                frame_seq
+                            );
+                        }
                     }
                     SessionAction::Shutdown => {
                         let _ = shutdown_tx.try_send(());

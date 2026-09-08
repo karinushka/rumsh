@@ -37,6 +37,8 @@ pub trait PacketCodec: Send + Sync + 'static {
         &self,
         bytes: &[u8],
     ) -> Result<Option<(EncryptedServerPacket, ServerPayload, CodecStats)>>;
+    /// Returns any incomplete frames currently held in the fragment buffer: (frame_seq, received_mask)
+    fn get_incomplete_frames(&self) -> Vec<(u64, Vec<u64>)>;
 }
 
 type FrameFragments = (u16, usize, HashMap<u16, Vec<u8>>);
@@ -106,11 +108,11 @@ impl FragmentBuffer {
                 full_ciphertext.len()
             );
 
-            // Prune any stale frames older than seq - 4
+            // Prune any incomplete frames older than this completed seq (they are superseded)
             while let Some((&old_seq, _)) = self.frames.iter().next() {
-                if old_seq < seq.saturating_sub(4) {
-                    log::warn!(
-                        "[CLIENT] [FRAME_PRUNED_INCOMPLETE] seq={} pruned because current seq={}",
+                if old_seq < seq {
+                    log::info!(
+                        "[CLIENT] [FRAME_PRUNED_SUPERSEDED] seq={} pruned because complete frame seq={} received",
                         old_seq,
                         seq
                     );
@@ -131,16 +133,36 @@ impl FragmentBuffer {
         } else {
             // Partial fragment buffered
             // Prune stale frames if map gets too large
-            if self.frames.len() > 10 {
+            if self.frames.len() > 32 {
                 let min_seq = *self.frames.keys().next().unwrap();
                 log::warn!(
-                    "[CLIENT] [FRAME_PRUNED_OVERFLOW] seq={} pruned due to buffer size > 10",
+                    "[CLIENT] [FRAME_PRUNED_OVERFLOW] seq={} pruned due to buffer size > 32",
                     min_seq
                 );
                 self.frames.remove(&min_seq);
             }
             None
         }
+    }
+
+    fn get_incomplete_frames(&self) -> Vec<(u64, Vec<u64>)> {
+        let mut result = Vec::new();
+        for (&seq, (total_frags, _, frags)) in &self.frames {
+            if *total_frags == 0 || frags.len() >= *total_frags as usize {
+                continue;
+            }
+            let words = (*total_frags as usize).div_ceil(64);
+            let mut mask = vec![0u64; words];
+            for &idx in frags.keys() {
+                let word_idx = (idx as usize) / 64;
+                let bit_idx = (idx as usize) % 64;
+                if word_idx < mask.len() {
+                    mask[word_idx] |= 1u64 << bit_idx;
+                }
+            }
+            result.push((seq, mask));
+        }
+        result
     }
 }
 
@@ -280,6 +302,10 @@ impl PacketCodec for ChaChaCodec {
             },
         )))
     }
+
+    fn get_incomplete_frames(&self) -> Vec<(u64, Vec<u64>)> {
+        self.fragment_buffer.lock().unwrap().get_incomplete_frames()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -395,6 +421,10 @@ impl PacketCodec for NullCodec {
                 decomp_len,
             },
         )))
+    }
+
+    fn get_incomplete_frames(&self) -> Vec<(u64, Vec<u64>)> {
+        self.fragment_buffer.lock().unwrap().get_incomplete_frames()
     }
 }
 
