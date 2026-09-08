@@ -247,7 +247,13 @@ pub async fn run_server(
                 match action {
                     SessionAction::SendPacket { bytes, target } => {
                         let socket = socket.clone();
+                        let wire_bytes = bytes.len();
                         smol::spawn(async move {
+                            log::info!(
+                                "[SERVER] [TX_PACKET] wire_bytes={} target={}",
+                                wire_bytes,
+                                target
+                            );
                             let _ = socket.send_to(&bytes, target).await;
                         })
                         .detach();
@@ -256,10 +262,23 @@ pub async fn run_server(
                         let socket = socket.clone();
                         let in_flight = diff_in_flight.clone();
                         in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let job_seq = job.seq;
+                        let job_ref = job.ref_seq;
+                        let job_ack = job.ack_seq;
                         smol::spawn(async move {
                             if let Ok(packets) = blocking::unblock(move || job.run()).await {
                                 let num_packets = packets.len();
                                 for (i, serialized) in packets.into_iter().enumerate() {
+                                    log::info!(
+                                        "[SERVER] [TX_PACKET] seq={} ack={} ref_seq={} frag={}/{} wire_bytes={} target={}",
+                                        job_seq,
+                                        job_ack,
+                                        job_ref,
+                                        i,
+                                        num_packets,
+                                        serialized.len(),
+                                        target
+                                    );
                                     let _ = socket.send_to(&serialized, target).await;
                                     if i + 1 < num_packets {
                                         Timer::after(Duration::from_millis(1)).await;

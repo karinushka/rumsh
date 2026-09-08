@@ -181,10 +181,17 @@ impl<C: PacketCodec> MirrorSession<C> {
         self.mirror.acknowledge(ack);
         self.mirror.record_rtt_loss(rtt_updated, loss_pct);
 
-        log::debug!("Client received packet seq={}", seq);
+        log::info!(
+            "[CLIENT] [PAYLOAD_RECEIVED] seq={} ack={} curr_ack={} silence={:?}",
+            seq,
+            ack,
+            self.ack_seq_num,
+            silence
+        );
+
         if seq <= self.ack_seq_num {
-            log::debug!(
-                "Client dropped out-of-order/duplicate packet seq={}, current ack={}",
+            log::info!(
+                "[CLIENT] [FRAME_DROP_DUPLICATE] seq={} <= curr_ack={}",
                 seq,
                 self.ack_seq_num
             );
@@ -203,11 +210,14 @@ impl<C: PacketCodec> MirrorSession<C> {
 
         match payload {
             ServerPayload::Frame(update) => {
-                log::debug!(
-                    "Client applying frame update: seq={}, ref_seq={}, rows={}",
+                log::info!(
+                    "[CLIENT] [FRAME_UPDATE] seq={} ref_seq={} row_updates={} cursor=({},{}) echo={}",
                     seq,
                     update.ref_seq,
-                    update.row_updates.len()
+                    update.row_updates.len(),
+                    update.cursor_x,
+                    update.cursor_y,
+                    update.is_echo_enabled
                 );
 
                 let ref_state_opt = if update.ref_seq == 0 {
@@ -222,10 +232,14 @@ impl<C: PacketCodec> MirrorSession<C> {
                     ref_grid.clone()
                 } else {
                     if update.ref_seq != 0 {
+                        let history_seqs: Vec<u64> = self.state_history.iter().map(|(s, _)| *s).collect();
                         log::warn!(
-                            "Reference state seq={} not found in history! Dropping packet seq={}",
+                            "[CLIENT] [FRAME_DROP_MISSING_REF] seq={} requested ref_seq={} not in history (len={}, history={:?}). Sending immediate ACK with ack_seq_num={}",
+                            seq,
                             update.ref_seq,
-                            seq
+                            self.state_history.len(),
+                            history_seqs,
+                            self.ack_seq_num
                         );
                         // Promptly notify server with our latest acknowledged sequence so it can send a full frame
                         if let Ok(ack_bytes) = self.prepare_ack(now) {
@@ -264,6 +278,12 @@ impl<C: PacketCodec> MirrorSession<C> {
                     self.state_history.pop_front();
                 }
 
+                log::info!(
+                    "[CLIENT] [FRAME_APPLIED] seq={} history_len={}",
+                    seq,
+                    self.state_history.len()
+                );
+
                 actions.push(ClientAction::Paint);
 
                 // Send rate-limited ACK packet back to server
@@ -274,10 +294,10 @@ impl<C: PacketCodec> MirrorSession<C> {
                 }
             }
             ServerPayload::KeepAlive => {
-                log::debug!("Client received KeepAlive");
+                log::info!("[CLIENT] [PAYLOAD_KEEPALIVE] seq={}", seq);
             }
             ServerPayload::Shutdown => {
-                log::info!("Client received Shutdown from server");
+                log::info!("[CLIENT] [PAYLOAD_SHUTDOWN] Server initiated disconnect seq={}", seq);
                 actions.push(ClientAction::Disconnect);
             }
             ServerPayload::HandshakeAck { .. } => {}
@@ -367,10 +387,13 @@ impl<C: PacketCodec> MirrorSession<C> {
 
             for (&seq, (packet_bytes, sent_time)) in &self.unacked_packets {
                 if now.duration_since(*sent_time) >= rtt_limit {
-                    log::debug!(
-                        "[ARQ] Retransmitting lost packet seq={}, age={:?}",
+                    let age = now.duration_since(*sent_time);
+                    log::info!(
+                        "[CLIENT] [TX_PACKET] seq={} ack={} type=ARQ_Retransmit wire_bytes={} age_ms={} is_resent=true",
                         seq,
-                        now.duration_since(*sent_time)
+                        self.ack_seq_num,
+                        packet_bytes.len(),
+                        age.as_millis()
                     );
                     packets_to_resend.push((packet_bytes.clone(), seq));
                 }
@@ -451,6 +474,13 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
 
+        log::info!(
+            "[CLIENT] [TX_PACKET] seq={} ack={} type=Keystrokes wire_bytes={} is_resent=false",
+            seq,
+            self.ack_seq_num,
+            packet_bytes.len()
+        );
+
         self.unacked_packets
             .insert(seq, (packet_bytes.clone(), now));
         Ok((packet_bytes, seq))
@@ -467,6 +497,13 @@ impl<C: PacketCodec> MirrorSession<C> {
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
 
+        log::info!(
+            "[CLIENT] [TX_PACKET] seq={} ack={} type=Ack wire_bytes={} is_resent=false",
+            seq,
+            self.ack_seq_num,
+            packet_bytes.len()
+        );
+
         Ok(packet_bytes)
     }
 
@@ -480,6 +517,13 @@ impl<C: PacketCodec> MirrorSession<C> {
         let packet_bytes =
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
+
+        log::info!(
+            "[CLIENT] [TX_PACKET] seq={} ack={} type=KeepAlive wire_bytes={} is_resent=false",
+            seq,
+            self.ack_seq_num,
+            packet_bytes.len()
+        );
 
         self.unacked_packets
             .insert(seq, (packet_bytes.clone(), now));
@@ -495,6 +539,15 @@ impl<C: PacketCodec> MirrorSession<C> {
         let packet_bytes =
             self.codec
                 .seal_client(self.session_id, seq, self.ack_seq_num, &payload)?;
+
+        log::info!(
+            "[CLIENT] [TX_PACKET] seq={} ack={} type=Resize cols={} rows={} wire_bytes={} is_resent=false",
+            seq,
+            self.ack_seq_num,
+            cols,
+            rows,
+            packet_bytes.len()
+        );
 
         self.unacked_packets
             .insert(seq, (packet_bytes.clone(), now));

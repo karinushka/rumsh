@@ -7,14 +7,21 @@ pub struct SessionBootstrapper {
     remote_binary: String,
     port_range: String,
     remote_bind: Option<String>,
+    remote_log_file: Option<String>,
 }
 
 impl SessionBootstrapper {
-    pub fn new(remote_binary: String, port_range: String, remote_bind: Option<String>) -> Self {
+    pub fn new(
+        remote_binary: String,
+        port_range: String,
+        remote_bind: Option<String>,
+        remote_log_file: Option<String>,
+    ) -> Self {
         Self {
             remote_binary,
             port_range,
             remote_bind,
+            remote_log_file,
         }
     }
 
@@ -34,9 +41,15 @@ impl SessionBootstrapper {
             "".to_string()
         };
 
+        let log_arg = if let Some(ref log_file) = self.remote_log_file {
+            format!(" --log-file {}", log_file)
+        } else {
+            "".to_string()
+        };
+
         let remote_cmd = format!(
-            "{} server --port-range {}{}",
-            self.remote_binary, self.port_range, bind_arg
+            "{} server --port-range {}{}{}",
+            self.remote_binary, self.port_range, bind_arg, log_arg
         );
         log::info!(
             "Executing remote SSH command: ssh -o ExitOnForwardFailure=yes {} \"{}\"",
@@ -133,7 +146,7 @@ mod tests {
     #[test]
     fn test_parse_token_success() {
         let bootstrapper =
-            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None);
+            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None, None);
         let input = "noise\nRUMSH CONNECT 60001 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\nmore noise";
         let reader = Cursor::new(input);
 
@@ -148,7 +161,7 @@ mod tests {
     #[test]
     fn test_parse_token_missing() {
         let bootstrapper =
-            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None);
+            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None, None);
         let input = "noise\nsome other connection message\nmore noise";
         let reader = Cursor::new(input);
 
@@ -163,7 +176,7 @@ mod tests {
     #[test]
     fn test_parse_token_malformed() {
         let bootstrapper =
-            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None);
+            SessionBootstrapper::new("rumsh".to_string(), "60000:61000".to_string(), None, None);
         let input = "RUMSH CONNECT not_a_port 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
         let reader = Cursor::new(input);
 

@@ -55,17 +55,38 @@ impl FragmentBuffer {
     ) -> Option<(EncryptedServerPacket, Vec<u8>, usize)> {
         if packet.total_frags <= 1 {
             // Unfragmented packet
+            log::info!(
+                "[CLIENT] [RX_PACKET] seq={} ack={} frag=0/1 wire_bytes={}",
+                packet.seq_num,
+                packet.ack_seq_num,
+                wire_len
+            );
             let ciphertext = packet.ciphertext.clone();
             return Some((packet, ciphertext, wire_len));
         }
 
         let seq = packet.seq_num;
+        let frag_idx = packet.frag_idx;
+        let total_frags = packet.total_frags;
+
         let entry = self
             .frames
             .entry(seq)
             .or_insert_with(|| (packet.total_frags, 0, HashMap::new()));
         entry.1 += wire_len;
-        entry.2.insert(packet.frag_idx, packet.ciphertext);
+        entry.2.insert(frag_idx, packet.ciphertext);
+        let curr_count = entry.2.len();
+
+        log::info!(
+            "[CLIENT] [RX_PACKET] seq={} ack={} frag={}/{} wire_bytes={} buffered_frags={}/{}",
+            seq,
+            packet.ack_seq_num,
+            frag_idx,
+            total_frags,
+            wire_len,
+            curr_count,
+            total_frags
+        );
 
         if entry.2.len() == entry.0 as usize {
             // Frame complete! Reassemble ciphertext in fragment order
@@ -77,9 +98,22 @@ impl FragmentBuffer {
                 }
             }
 
+            log::info!(
+                "[CLIENT] [FRAME_REASSEMBLED] seq={} total_frags={} total_wire_bytes={} ciphertext_bytes={}",
+                seq,
+                total_frags,
+                total_wire_len,
+                full_ciphertext.len()
+            );
+
             // Prune any stale frames older than seq - 4
             while let Some((&old_seq, _)) = self.frames.iter().next() {
                 if old_seq < seq.saturating_sub(4) {
+                    log::warn!(
+                        "[CLIENT] [FRAME_PRUNED_INCOMPLETE] seq={} pruned because current seq={}",
+                        old_seq,
+                        seq
+                    );
                     self.frames.remove(&old_seq);
                 } else {
                     break;
@@ -99,6 +133,10 @@ impl FragmentBuffer {
             // Prune stale frames if map gets too large
             if self.frames.len() > 10 {
                 let min_seq = *self.frames.keys().next().unwrap();
+                log::warn!(
+                    "[CLIENT] [FRAME_PRUNED_OVERFLOW] seq={} pruned due to buffer size > 10",
+                    min_seq
+                );
                 self.frames.remove(&min_seq);
             }
             None

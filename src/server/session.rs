@@ -222,17 +222,38 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
 
         let seq_num = wire_packet.seq_num;
         let ack_seq_num = wire_packet.ack_seq_num;
+        let payload_kind = match &payload {
+            ClientPayload::Ack => "Ack",
+            ClientPayload::Keystrokes(_) => "Keystrokes",
+            ClientPayload::Resize { .. } => "Resize",
+            ClientPayload::KeepAlive => "KeepAlive",
+            ClientPayload::Handshake { .. } => "Handshake",
+        };
+        log::info!(
+            "[SERVER] [RX_PACKET] seq={} ack={} type={} wire_bytes={} expected_seq={}",
+            seq_num,
+            ack_seq_num,
+            payload_kind,
+            packet_bytes.len(),
+            self.expected_client_seq
+        );
+
         let mut actions = Vec::new();
 
         if seq_num < self.expected_client_seq {
+            log::info!(
+                "[SERVER] [RX_DUPLICATE] seq={} < expected_seq={}. Triggering sync check.",
+                seq_num,
+                self.expected_client_seq
+            );
             self.dirty = true;
             actions.extend(self.check_sync(now));
             return Ok(actions);
         }
 
         if seq_num > self.expected_client_seq {
-            log::debug!(
-                "[SLIDING_WINDOW] Out of order packet seq={}, expected={}. Buffering.",
+            log::warn!(
+                "[SERVER] [RX_BUFFER_OFO] seq={} > expected_seq={}. Buffering payload.",
                 seq_num,
                 self.expected_client_seq
             );
@@ -246,8 +267,8 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         while let Some(buffered_payload) =
             self.out_of_order_packets.remove(&self.expected_client_seq)
         {
-            log::debug!(
-                "[SLIDING_WINDOW] Recovered buffered packet seq={}",
+            log::info!(
+                "[SERVER] [RX_RECOVER_OFO] Recovered buffered packet seq={}",
                 self.expected_client_seq
             );
             packets_to_process.push((self.expected_client_seq, buffered_payload));
@@ -260,10 +281,14 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         for (seq, payload) in packets_to_process {
             match payload {
                 ClientPayload::Ack => {
-                    log::trace!("Received pure ACK from client");
+                    log::info!("[SERVER] [PROCESSED_ACK] seq={} client_ack={}", seq, ack_seq_num);
                 }
                 ClientPayload::Keystrokes(keys) => {
-                    log::trace!("Received keystrokes seq={}, size={}", seq, keys.len());
+                    log::info!(
+                        "[SERVER] [PROCESSED_KEYSTROKES] seq={} size={}",
+                        seq,
+                        keys.len()
+                    );
                     if let Ok(p) = self.pty.lock()
                         && let Err(e) = p.write(&keys)
                     {
@@ -271,7 +296,12 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                     }
                 }
                 ClientPayload::Resize { cols, rows } => {
-                    log::info!("Received resize request: {}x{} (seq={})", cols, rows, seq);
+                    log::info!(
+                        "[SERVER] [PROCESSED_RESIZE] seq={} cols={} rows={}",
+                        seq,
+                        cols,
+                        rows
+                    );
                     if let Ok(p) = self.pty.lock() {
                         let _ = p.resize(cols, rows);
                     }
@@ -279,7 +309,7 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
                     self.dirty = true;
                 }
                 ClientPayload::KeepAlive => {
-                    log::trace!("Received KeepAlive, queueing reply...");
+                    log::info!("[SERVER] [PROCESSED_KEEPALIVE] seq={}", seq);
                     let reply_payload = ServerPayload::KeepAlive;
                     self.seq_num += 1;
                     let packets =
@@ -392,7 +422,7 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         let force_full_sync = lag > 5;
 
         let ref_state_opt = if force_full_sync {
-            log::info!("[HEAL] Client ACK lag={} > 5, forcing full-sync baseline (ref_seq=0)", lag);
+            log::info!("[SERVER] [HEAL] Client ACK lag={} > 5 (srv_seq={} client_ack={}), forcing full-sync baseline (ref_seq=0)", lag, self.seq_num, self.client_ack_seq);
             None
         } else {
             self.state_history
@@ -404,11 +434,26 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
         let ref_seq = if ref_state_opt.is_some() {
             self.client_ack_seq
         } else {
+            if !force_full_sync && self.client_ack_seq != 0 {
+                log::warn!(
+                    "[SERVER] [HEAL] Client ACK seq={} not found in server history (len={}), falling back to full-sync baseline (ref_seq=0)",
+                    self.client_ack_seq,
+                    self.state_history.len()
+                );
+            }
             0
         };
 
         self.seq_num += 1;
         let seq = self.seq_num;
+
+        log::info!(
+            "[SERVER] [DIFF_QUEUED] seq={} ack={} ref_seq={} history_len={}",
+            seq,
+            self.ack_seq_num,
+            ref_seq,
+            self.state_history.len()
+        );
 
         let latest_state_cloned = latest_grid.clone();
 

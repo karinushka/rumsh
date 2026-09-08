@@ -15,6 +15,10 @@ struct Cli {
     #[arg(short, long, global = true)]
     log_file: Option<String>,
 
+    /// Enable debug logging to file (default log files if --log-file is not specified)
+    #[arg(short, long, global = true)]
+    debug: bool,
+
     /// Client mode: Server address (host:port) or SSH target (user@host)
     target: Option<String>,
 
@@ -33,6 +37,10 @@ struct Cli {
     /// Client mode: Path to rumsh binary on remote server
     #[arg(long, default_value = "rumsh")]
     remote_binary: String,
+
+    /// Client mode: Path to log file on remote server (bootstrap mode only)
+    #[arg(long)]
+    remote_log_file: Option<String>,
 
     /// Client mode: Enable real-time debugging overlay in the top-right corner
     #[arg(short, long)]
@@ -180,10 +188,18 @@ fn run_client_mode(cli: Cli) -> Result<()> {
         (addr, key_bytes)
     } else {
         // SSH Bootstrap mode
+        let remote_log = if let Some(ref path) = cli.remote_log_file {
+            Some(path.clone())
+        } else if cli.debug {
+            Some("/tmp/rumsh-server.log".to_string())
+        } else {
+            None
+        };
         let bootstrapper = SessionBootstrapper::new(
             cli.remote_binary.clone(),
             cli.port_range.clone(),
             cli.remote_bind.clone(),
+            remote_log,
         );
         bootstrapper.bootstrap(target_str)?
     };
@@ -196,12 +212,39 @@ fn run_client_mode(cli: Cli) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut builder = env_logger::Builder::from_default_env();
-    if let Some(ref path) = cli.log_file {
-        let file = std::fs::File::create(path)?;
+    let log_path = match cli.log_file {
+        Some(ref path) => Some(std::path::PathBuf::from(path)),
+        None if cli.debug => match cli.command {
+            Some(Commands::Server { .. }) => Some(std::path::PathBuf::from("/tmp/rumsh-server.log")),
+            None => Some(
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join("rumsh-client.log"),
+            ),
+        },
+        None => None,
+    };
+
+    if let Some(ref path) = log_path {
+        // Ensure parent directory exists and open log file
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        let mut builder = env_logger::Builder::from_default_env();
+        if std::env::var("RUST_LOG").is_err() {
+            builder.filter_level(log::LevelFilter::Debug);
+        }
         builder.target(env_logger::Target::Pipe(Box::new(file)));
+        builder.init();
+
+        log::info!("Logging initialized to file: {}", path.display());
     }
-    builder.init();
 
     match cli.command {
         Some(Commands::Server {
