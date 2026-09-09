@@ -117,10 +117,10 @@ The current high-performance state of `rumsh` is the result of systematic profil
 
 ### 3.7. Sliding Window Protocol & Reliable UDP Transport (ARQ)
 *   **The Problem (Packet Loss)**: In an unreliable network (e.g., 10% packet drop and 500ms delay), simple UDP packet delivery causes permanent keystroke or layout losses, leading to terminal state desynchronization.
-*   **The Solution (Server-Side Sliding Window)**: The server enforces strict in-order packet processing. Out-of-order client packets are buffered in a `BTreeMap`. If a sequence gap is detected, the server halts processing of subsequent packets. Once the client retransmits the missing packet and fills the gap, the server processes the buffered batch in a single chronological sweep.
-*   **The Solution (Client-Side ARQ)**: The client buffers all sent session packets in an `unacked_packets` map. An asynchronous ARQ task runs every 100ms, checking the age of unacknowledged packets and retransmitting them if their age exceeds a dynamic retransmission timeout (RTO = 2x RTT, capped between 200ms and 1000ms).
+*   **The Solution (Server-Side Sliding Window)**: The server enforces strict in-order packet processing for reliable stream packets. Out-of-order client packets are buffered in a `BTreeMap`. If a sequence gap is detected, the server halts processing of subsequent packets. Once the client retransmits the missing packet and fills the gap, the server processes the buffered batch in a single chronological sweep.
+*   **The Solution (Client-Side ARQ)**: The client buffers all sent reliable stream packets in an `unacked_packets` map. An asynchronous ARQ check runs every 100ms, checking the age of unacknowledged packets and retransmitting them if their age exceeds a dynamic retransmission timeout (RTO = 2x RTT, capped between 200ms and 1000ms).
 *   **The Solution (Cumulative ACKs)**: The connection uses standard cumulative ACKs. The `ack_seq_num` sent in every packet strictly represents the highest *consecutively processed* sequence number, ensuring the sender only prunes packets the receiver has actually processed in-order.
-*   **The Solution (Reliable Heartbeats)**: `KeepAlive` packets are fully reliable (saved in `unacked_packets` and retransmitted), preventing permanent sequence gaps on the server if a heartbeat is dropped, while maintaining cryptographic nonce uniqueness. Pure ACKs do not consume sequence numbers to avoid unreliable gap deadlocks.
+*   **The Solution (Reliable Heartbeats)**: `KeepAlive` packets are fully reliable (saved in `unacked_packets` and retransmitted), preventing permanent sequence gaps on the server if a heartbeat is dropped, while maintaining cryptographic nonce uniqueness.
 
 ### 3.8. OS-Process-Aware Local Echo Heuristic
 *   **The Challenge**: Local character echo is essential for a responsive feel under high latency (e.g. 500ms lag). However, interactive shells (using GNU Readline like `bash`) explicitly disable the kernel-level tty `ECHO` flag at the prompt to manage line editing manually. This caused standard local echo checks to always report echo as disabled, resulting in laggy typing at the prompt.
@@ -177,7 +177,19 @@ The current high-performance state of `rumsh` is the result of systematic profil
     *   **Lock-Free Single-Threaded Loops**: In `run_client` and `run_server`, we absorbed protocol timers and state machines into `MirrorSession` and `AuthoritativeSession`. By passing declarative actions (`ClientAction`, `SessionAction`) across the seam, we eliminated all lock contention and stripped out `Arc<Mutex<...>>` / `Rc<RefCell<...>>` wrappers from network loops.
     *   **Unified Codec Seam**: We created `PacketCodec` (`SecureCodec`), stripping secret key material (`[u8; 32]`), nonce generation, and compression flags out of session logic.
     *   **Isolated OS & Grid Math**: We created `TerminalGrid` (`src/protocol/grid.rs`), `LocalEchoEngine` (`src/client/echo.rs`), and `TerminalLifecycle` (`src/client/lifecycle.rs`). This removed 70 lines of diffing loops from server sessions, removed prediction rollback math from terminal mirrors, and liberated client networking from libc process control.
-    *   **Testability Payoff**: By introducing mockable trait seams (`NullCodec`, `FakeLifecycleBackend`), our automated test suite expanded to **37 fast, deterministic unit tests** verifying protocol ordering, tamper rejection, local echo rollback, and RAII cleanup in memory without touching OS terminal modes.
+    *   **Testability Payoff**: By introducing mockable trait seams (`NullCodec`, `FakeLifecycleBackend`), our automated test suite expanded to **40 fast, deterministic unit tests** verifying protocol ordering, tamper rejection, local echo rollback, and RAII cleanup in memory without touching OS terminal modes.
+
+### 3.20. MTU Framing & Selective Fragment Retransmission (Bitmask NACKs)
+*   **The Challenge**: Large terminal updates (e.g., full screen repaints in Vim or `htop`) frequently exceed standard Ethernet MTUs (1500 bytes). If sent as large IP datagrams, IP-level packet fragmentation occurs; dropping a single fragment drops the entire datagram, crippling throughput over lossy mobile links.
+*   **The Solution**: Implemented transport-level framing (`TARGET_MTU = 1200`, `FRAGMENT_PAYLOAD_SIZE = 1024`). Large payloads are split into numbered fragments (`WireFragment`). When the client receives fragments for a frame, it tracks received fragment indices in a bitmask (`received_mask: Vec<u64>`). If fragments are missing after a debounce window (40ms), the client sends a `FragmentNack` carrying the bitmask. The server inspects the mask and selectively retransmits **only** the missing fragments rather than the entire multi-kilobyte frame.
+
+### 3.21. High-Bit Sequence Space Partitioning for Transient Feedback Packets
+*   **The Problem**: ChaCha20-Poly1305 requires strictly unique nonces (`salt[4] + seq_num[8]`). Previously, transient client feedback packets (`Ack`, `FragmentNack`) shared the same sequence counter (`self.seq_num`) as reliable stream packets (`Keystrokes`, `Resize`, `KeepAlive`). However, transient packets are not tracked by ARQ in `unacked_packets`. If UDP dropped a transient packet, a permanent hole was punched in the sequence space. The server's in-order sliding window stalled waiting for the dropped sequence number forever, permanently buffering all subsequent user keystrokes in `out_of_order_packets`.
+*   **The Solution**: Partitioned the 64-bit sequence space into two independent domains:
+    *   **Reliable Stream Packets** (`Keystrokes`, `Resize`, `KeepAlive`): Sequential integers starting from 1 (`seq < 1 << 63`). Every reliable packet is tracked by ARQ and acknowledged consecutively.
+    *   **Transient Control Packets** (`Ack`, `FragmentNack`): Independent counter setting the high bit: `seq = (1 << 63) | transient_seq_num`.
+    *   **Out-of-Band Server Processing**: On the server, packets with the high bit set or matching transient payloads bypass the sliding window ordering queue entirely. They update cumulative ACKs and trigger actions (e.g. fragment retransmissions) immediately without altering `expected_client_seq`.
+    *   **Security & Correctness**: Guarantees zero sequence holes in the reliable stream, prevents sliding window deadlocks on packet loss, and mathematically ensures 100% nonce uniqueness across all encrypted packets in the session.
 
 ---
 
@@ -208,10 +220,12 @@ The current high-performance state of `rumsh` is the result of systematic profil
 *   `ciphertext` (Vec<u8>): Encrypted `ClientPayload`.
 
 #### `ClientPayload` Varieties:
-*   `Handshake { client_version }`: Initiates connection.
-*   `Keystrokes(Vec<u8>)`: Raw input bytes.
-*   `Resize { cols, rows }`: Sent when the host terminal window resizes.
-*   `KeepAlive`: Heartbeat packet.
+*   `Handshake { client_version, cols, rows }`: Initiates connection.
+*   `Keystrokes(Vec<u8>)`: Raw input bytes (reliable stream).
+*   `Resize { cols, rows }`: Sent when the host terminal window resizes (reliable stream).
+*   `KeepAlive`: Heartbeat packet (reliable stream).
+*   `Ack`: Cumulative acknowledgement packet (transient control, out-of-band).
+*   `FragmentNack { frame_seq, received_mask }`: Selective fragment retransmission request (transient control, out-of-band).
 
 ---
 

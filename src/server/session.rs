@@ -247,6 +247,41 @@ impl<P: PtyBackend, C: PacketCodec> AuthoritativeSession<P, C> {
 
         let mut actions = Vec::new();
 
+        // Check if this is a transient control packet (Ack or FragmentNack)
+        // Transient packets do not participate in reliable stream ordering (they have the high bit set)
+        let is_transient = (seq_num & (1u64 << 63)) != 0
+            || matches!(payload, ClientPayload::Ack | ClientPayload::FragmentNack { .. });
+
+        if is_transient {
+            if ack_seq_num > self.client_ack_seq {
+                self.client_ack_seq = ack_seq_num;
+            }
+            match payload {
+                ClientPayload::Ack => {
+                    log::info!("[SERVER] [PROCESSED_ACK] seq={} client_ack={}", seq_num, ack_seq_num);
+                }
+                ClientPayload::FragmentNack {
+                    frame_seq,
+                    received_mask,
+                } => {
+                    log::info!(
+                        "[SERVER] [PROCESSED_FRAGMENT_NACK] seq={} frame_seq={} mask_len={}",
+                        seq_num,
+                        frame_seq,
+                        received_mask.len()
+                    );
+                    actions.push(SessionAction::ResendFragments {
+                        frame_seq,
+                        received_mask,
+                        target: self.current_client_addr,
+                    });
+                }
+                _ => {}
+            }
+            actions.extend(self.check_sync(now));
+            return Ok(actions);
+        }
+
         if seq_num < self.expected_client_seq {
             log::info!(
                 "[SERVER] [RX_DUPLICATE] seq={} < expected_seq={}. Dropping duplicate packet.",
@@ -754,5 +789,59 @@ mod tests {
         // Tick after 160ms (exceeding 150ms) -> should emit consolidated frame
         let actions_flooded = session.on_tick(start + Duration::from_millis(165));
         assert_eq!(actions_flooded.len(), 1, "Expected tick to fire after flood interval");
+    }
+
+    #[test]
+    fn test_transient_packet_does_not_stall_reliable_packets() {
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let fake_pty = FakePty::new();
+        let codec = NullCodec::new(12345);
+        let mut session =
+            AuthoritativeSession::new(12345, codec, 0, addr, 80, 24, fake_pty).unwrap();
+
+        // 1. Client sends reliable packet 1 (keystrokes "hello")
+        let pkt1 = make_client_packet(&session, 1, &ClientPayload::Keystrokes(b"hello".to_vec()));
+        let _ = session.feed_packet(&pkt1, addr, Instant::now()).unwrap();
+        assert_eq!(session.ack_seq_num, 1);
+        assert_eq!(session.expected_client_seq, 2);
+
+        // 2. Client sends a transient packet (e.g. FragmentNack or Ack) with high-bit seq
+        let transient_seq = (1u64 << 63) | 1;
+        let nack_pkt = make_client_packet(
+            &session,
+            transient_seq,
+            &ClientPayload::FragmentNack {
+                frame_seq: 10,
+                received_mask: vec![1],
+            },
+        );
+        let actions = session.feed_packet(&nack_pkt, addr, Instant::now()).unwrap();
+        // Should generate ResendFragments immediately and NOT alter expected_client_seq
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], SessionAction::ResendFragments { .. }));
+        assert_eq!(session.expected_client_seq, 2);
+        assert!(session.out_of_order_packets.is_empty());
+
+        // 3. Transient packet 2 is lost in UDP transit! (never arrives)
+
+        // 4. Client sends next reliable packet 2 (keystrokes "world")
+        let pkt2 = make_client_packet(&session, 2, &ClientPayload::Keystrokes(b"world".to_vec()));
+        let _ = session.feed_packet(&pkt2, addr, Instant::now()).unwrap();
+
+        // Reliable packet 2 should be processed immediately without stalling
+        assert_eq!(session.ack_seq_num, 2);
+        assert_eq!(session.expected_client_seq, 3);
+        assert!(session.out_of_order_packets.is_empty());
+        assert_eq!(
+            session
+                .pty
+                .lock()
+                .unwrap()
+                .written
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[b"hello".to_vec(), b"world".to_vec()]
+        );
     }
 }

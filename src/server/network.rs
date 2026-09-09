@@ -152,8 +152,7 @@ async fn wait_for_client_handshake(
                     let _ = socket.send_to(&serialized, src_addr).await;
                 }
 
-                log::info!("Connecting UDP socket to client {}", src_addr);
-                socket.connect(src_addr).await?;
+                log::info!("Handshake complete for client {}", src_addr);
 
                 return Ok(HandshakeResult {
                     client_addr: src_addr,

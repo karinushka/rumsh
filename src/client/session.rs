@@ -39,6 +39,7 @@ pub struct MirrorSession<C: PacketCodec> {
     pub keepalive_interval: Duration,
     pub last_ack_sent: Instant,
     pub is_reconnecting: bool,
+    pub transient_seq_num: u64,
 
     // Fragment NACK Tracking
     pub last_nack_check: Instant,
@@ -87,6 +88,7 @@ impl<C: PacketCodec> MirrorSession<C> {
             keepalive_interval: Duration::from_secs(2),
             last_ack_sent: now,
             is_reconnecting: false,
+            transient_seq_num: 0,
             last_nack_check: now,
             nacked_frames: HashMap::new(),
             expected_server_seq: start_server_seq,
@@ -469,7 +471,7 @@ impl<C: PacketCodec> MirrorSession<C> {
                 };
                 if should_nack {
                     self.nacked_frames.insert(frame_seq, now);
-                    let packet_bytes = self.prepare_fragment_nack(frame_seq, received_mask, now)?;
+                    let packet_bytes = self.prepare_fragment_nack(frame_seq, received_mask)?;
                     actions.push(ClientAction::SendPacket(packet_bytes));
                 }
             }
@@ -514,9 +516,8 @@ impl<C: PacketCodec> MirrorSession<C> {
     }
 
     fn prepare_ack(&mut self, now: Instant) -> Result<Vec<u8>> {
-        self.seq_num += 1;
-        let seq = self.seq_num;
-        self.sent_packets.insert(seq, now);
+        self.transient_seq_num += 1;
+        let seq = (1u64 << 63) | self.transient_seq_num;
         self.last_ack_sent = now;
 
         let payload = ClientPayload::Ack;
@@ -585,11 +586,9 @@ impl<C: PacketCodec> MirrorSession<C> {
         &mut self,
         frame_seq: u64,
         received_mask: Vec<u64>,
-        now: Instant,
     ) -> Result<Vec<u8>> {
-        self.seq_num += 1;
-        let seq = self.seq_num;
-        self.sent_packets.insert(seq, now);
+        self.transient_seq_num += 1;
+        let seq = (1u64 << 63) | self.transient_seq_num;
 
         let payload = ClientPayload::FragmentNack {
             frame_seq,
